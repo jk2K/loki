@@ -1,6 +1,8 @@
 package bloomgateway
 
 import (
+	"context"
+	"math/rand"
 	"time"
 
 	"github.com/oklog/ulid"
@@ -15,6 +17,10 @@ const (
 	Day = 24 * time.Hour
 )
 
+var (
+	entropy = rand.New(rand.NewSource(time.Now().UnixNano()))
+)
+
 type tokenSettings struct {
 	nGramLen int
 }
@@ -26,10 +32,12 @@ type Task struct {
 	// Tenant is the tenant ID
 	Tenant string
 
-	// ErrCh is a send-only channel to write an error to
-	ErrCh chan error
-	// ResCh is a send-only channel to write partial responses to
-	ResCh chan v1.Output
+	// errCh is a send-only channel to write an error to
+	errCh chan error
+	// resCh is a send-only channel to write partial responses to
+	resCh chan v1.Output
+	// channel to notify listener that the task is done
+	done chan struct{}
 
 	// series of the original request
 	series []*logproto.GroupedChunkRefs
@@ -37,6 +45,8 @@ type Task struct {
 	filters []syntax.LineFilter
 	// from..through date of the task's chunks
 	bounds model.Interval
+	// the context from the request
+	ctx context.Context
 
 	// TODO(chaudum): Investigate how to remove that.
 	day model.Time
@@ -45,23 +55,23 @@ type Task struct {
 // NewTask returns a new Task that can be enqueued to the task queue.
 // In addition, it returns a result and an error channel, as well
 // as an error if the instantiation fails.
-func NewTask(tenantID string, refs seriesWithBounds, filters []syntax.LineFilter) (Task, error) {
-	key, err := ulid.New(ulid.Now(), nil)
+func NewTask(ctx context.Context, tenantID string, refs seriesWithBounds, filters []syntax.LineFilter) (Task, error) {
+	key, err := ulid.New(ulid.Now(), entropy)
 	if err != nil {
 		return Task{}, err
 	}
-	errCh := make(chan error, 1)
-	resCh := make(chan v1.Output, len(refs.series))
 
 	task := Task{
 		ID:      key,
 		Tenant:  tenantID,
-		ErrCh:   errCh,
-		ResCh:   resCh,
+		errCh:   make(chan error),
+		resCh:   make(chan v1.Output),
 		filters: filters,
 		series:  refs.series,
 		bounds:  refs.bounds,
 		day:     refs.day,
+		ctx:     ctx,
+		done:    make(chan struct{}),
 	}
 	return task, nil
 }
@@ -70,17 +80,32 @@ func (t Task) Bounds() (model.Time, model.Time) {
 	return t.bounds.Start, t.bounds.End
 }
 
+func (t Task) Done() <-chan struct{} {
+	return t.done
+}
+
+func (t Task) Close() {
+	close(t.done)
+}
+
+func (t Task) CloseWithError(err error) {
+	t.errCh <- err
+	close(t.done)
+}
+
 // Copy returns a copy of the existing task but with a new slice of grouped chunk refs
 func (t Task) Copy(series []*logproto.GroupedChunkRefs) Task {
+	// do not copy ID to distinguish it as copied task
 	return Task{
-		ID:      ulid.ULID{}, // create emty ID to distinguish it as copied task
 		Tenant:  t.Tenant,
-		ErrCh:   t.ErrCh,
-		ResCh:   t.ResCh,
+		errCh:   t.errCh,
+		resCh:   t.resCh,
 		filters: t.filters,
 		series:  series,
 		bounds:  t.bounds,
 		day:     t.day,
+		ctx:     t.ctx,
+		done:    make(chan struct{}),
 	}
 }
 
@@ -133,7 +158,7 @@ func (it *taskMergeIterator) Next() bool {
 		Fp:       model.Fingerprint(group.Value().Fingerprint),
 		Chks:     convertToChunkRefs(group.Value().Refs),
 		Searches: convertToSearches(task.filters, it.tokenizer),
-		Response: task.ResCh,
+		Response: task.resCh,
 	}
 	return true
 }
